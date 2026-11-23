@@ -260,11 +260,10 @@ export class StellarService implements OnModuleInit {
       for (const op of ops.records as unknown as HorizonPaymentRecord[]) {
         if (op.type === 'payment') {
           const isUsdc = op.asset_code === 'USDC' && op.asset_issuer === this.usdcAsset.getIssuer();
-          const isXlm = op.asset_type === 'native';
 
-          if (isUsdc || isXlm) {
+          if (isUsdc) {
             const amount = parseFloat(op.amount);
-            return { verified: true, amount, asset: isUsdc ? 'USDC' : 'XLM', from: op.from };
+            return { verified: true, amount, asset: 'USDC', from: op.from };
           }
         }
       }
