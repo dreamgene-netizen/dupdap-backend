@@ -58,6 +58,8 @@ export class StellarService implements OnModuleInit {
   private sorobanRpcServer: StellarSdk.rpc.Server;
   private keypair: StellarSdk.Keypair;
   private networkPassphrase: string;
+  /** Inclusion fee floor in stroops (`STELLAR_MIN_FEE`); simulation adds the resource fee on top. */
+  private minFee = Number(StellarSdk.BASE_FEE);
   private usdcAsset: StellarSdk.Asset;
   private sorobanContractId: string;
   private horizonBreaker: CircuitBreaker;
@@ -83,6 +85,12 @@ export class StellarService implements OnModuleInit {
     );
     this.networkPassphrase =
       network === 'PUBLIC' ? StellarSdk.Networks.PUBLIC : StellarSdk.Networks.TESTNET;
+
+    const minFeeConfig = this.config.get<string>('STELLAR_MIN_FEE');
+    this.minFee = minFeeConfig === undefined ? Number(StellarSdk.BASE_FEE) : Number(minFeeConfig);
+    if (!Number.isSafeInteger(this.minFee) || this.minFee < Number(StellarSdk.BASE_FEE)) {
+      throw new Error(`STELLAR_MIN_FEE must be an integer >= ${StellarSdk.BASE_FEE} stroops`);
+    }
 
     this.horizonBreaker = new CircuitBreaker({
       name: 'stellar-horizon',
@@ -329,7 +337,7 @@ export class StellarService implements OnModuleInit {
       const source = await this.callHorizon(() => this.server.loadAccount(this.keypair.publicKey()));
       const contract = new StellarSdk.Contract(this.sorobanContractId);
       const tx = new StellarSdk.TransactionBuilder(source, {
-        fee: StellarSdk.BASE_FEE,
+        fee: String(this.minFee),
         networkPassphrase: this.networkPassphrase,
       })
         .addOperation(contract.call(fn, ...args.map((arg) => StellarSdk.nativeToScVal(arg))))
@@ -350,7 +358,19 @@ export class StellarService implements OnModuleInit {
       const preparedTx = StellarSdk.rpc.assembleTransaction(tx, simulated).build();
       preparedTx.sign(this.keypair);
 
-      const submitted = await this.sorobanRpc.call('submit transaction', (rpc) => rpc.sendTransaction(preparedTx));
+      let submitted = await this.sorobanRpc.call('submit transaction', (rpc) => rpc.sendTransaction(preparedTx));
+      if (submitted.status === 'ERROR' && submitted.errorResult?.result().switch().name === 'txInsufficientFee') {
+        // Fee too low for current network load: resubmit once as a fee bump at 2x the original total fee.
+        this.logger.warn(`Soroban rejected fee for ${fn} as insufficient; resubmitting as fee bump`);
+        const bumpTx = StellarSdk.TransactionBuilder.buildFeeBumpTransaction(
+          this.keypair,
+          String(Math.ceil((Number(preparedTx.fee) * 2) / (preparedTx.operations.length + 1))),
+          preparedTx,
+          this.networkPassphrase,
+        );
+        bumpTx.sign(this.keypair);
+        submitted = await this.sorobanRpc.call('submit transaction', (rpc) => rpc.sendTransaction(bumpTx));
+      }
       if (submitted.status !== 'PENDING') {
         throw new SorobanRpcException(
           'Soroban sendTransaction failed',
